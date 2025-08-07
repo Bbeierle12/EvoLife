@@ -11,6 +11,10 @@ const MessageTypes = {
   KNOWLEDGE_SHARE: 'knowledge'
 };
 
+// Simulation constants
+const MAX_AGENTS = 200; // Hard cap to prevent runaway reproduction
+const RESOURCE_INSTANCED_THRESHOLD = 150; // Switch to InstancedMesh beyond this count
+
 // Message System for Agent Communication
 class Message {
   constructor(sender, type, content, priority = 'normal') {
@@ -1700,6 +1704,19 @@ const EcosystemSimulator = () => {
   const rendererRef = useRef(null);
   const cameraRef = useRef(null);
   const resourceMeshesRef = useRef(new Map());
+  const pooledGeometriesRef = useRef({
+    resourceBox: new THREE.BoxGeometry(0.5, 0.3, 0.5),
+    ringInner: new THREE.RingGeometry(0.5, 0.7, 16),
+    ringOuter: new THREE.RingGeometry(1.5, 1.8, 16),
+    trustSphere: new THREE.SphereGeometry(0.08, 4, 4),
+  });
+  const pooledMaterialsRef = useRef({
+    resourceLambert: new THREE.MeshLambertMaterial({ color: 0x55aa55 }),
+    ringBasic: new THREE.MeshBasicMaterial({ color: 0x00ff00, side: THREE.DoubleSide, transparent: true, opacity: 0 }),
+    trustBasic: new THREE.MeshBasicMaterial({ color: 0xffff00, transparent: true, opacity: 0.7 }),
+    clickRing: new THREE.MeshBasicMaterial({ color: 0x00ff00, side: THREE.DoubleSide, transparent: true, opacity: 0.5 }),
+  });
+  const instancedResourcesRef = useRef(null);
   const playerAgentRef = useRef(null);
   const raycasterRef = useRef(new THREE.Raycaster());
   const mouseRef = useRef(new THREE.Vector2());
@@ -1736,22 +1753,71 @@ const EcosystemSimulator = () => {
 
   const updateResourceVisualization = (scene, resources) => {
     if (!scene) return;
-    
-    resourceMeshesRef.current.forEach((mesh) => {
-      scene.remove(mesh);
-    });
-    resourceMeshesRef.current.clear();
-    
-    resources.forEach((resource, id) => {
-      const geometry = new THREE.BoxGeometry(0.5, 0.3, 0.5);
-      const material = new THREE.MeshLambertMaterial({
-        color: new THREE.Color().setHSL(0.3, 0.8, 0.3 + resource.quality * 0.4)
+    const count = resources.size;
+
+    // Use InstancedMesh for high resource counts
+    if (count >= RESOURCE_INSTANCED_THRESHOLD) {
+      // Remove individual meshes if present
+      resourceMeshesRef.current.forEach((mesh) => {
+        scene.remove(mesh);
       });
-      
-      const mesh = new THREE.Mesh(geometry, material);
+      resourceMeshesRef.current.clear();
+
+      // Create or resize InstancedMesh
+      let inst = instancedResourcesRef.current;
+      if (!inst || inst.count !== count) {
+        if (inst) scene.remove(inst);
+        const mat = pooledMaterialsRef.current.resourceLambert.clone();
+        inst = new THREE.InstancedMesh(pooledGeometriesRef.current.resourceBox, mat, count);
+        inst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+        inst.name = 'resources-instanced';
+        instancedResourcesRef.current = inst;
+        scene.add(inst);
+      }
+      const dummy = new THREE.Object3D();
+      const color = new THREE.Color();
+      let i = 0;
+      resources.forEach((r) => {
+        dummy.position.set(r.position.x, 0.15, r.position.z);
+        dummy.updateMatrix();
+        inst.setMatrixAt(i, dummy.matrix);
+        if (inst.setColorAt) inst.setColorAt(i, color.setHSL(0.3, 0.8, 0.3 + r.quality * 0.4));
+        i++;
+      });
+      inst.instanceMatrix.needsUpdate = true;
+      if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
+      return;
+    }
+
+    // Below threshold: diff per-id meshes
+    if (instancedResourcesRef.current) {
+      scene.remove(instancedResourcesRef.current);
+      instancedResourcesRef.current = null;
+    }
+    const currentIds = new Set(resourceMeshesRef.current.keys());
+    const nextIds = new Set(resources.keys());
+    // Remove gone resources
+    currentIds.forEach((id) => {
+      if (!nextIds.has(id)) {
+        const mesh = resourceMeshesRef.current.get(id);
+        if (mesh) scene.remove(mesh);
+        resourceMeshesRef.current.delete(id);
+      }
+    });
+    // Add/update existing
+    resources.forEach((resource, id) => {
+      let mesh = resourceMeshesRef.current.get(id);
+      if (!mesh) {
+        mesh = new THREE.Mesh(
+          pooledGeometriesRef.current.resourceBox,
+          pooledMaterialsRef.current.resourceLambert.clone()
+        );
+        mesh.name = 'resource';
+        scene.add(mesh);
+        resourceMeshesRef.current.set(id, mesh);
+      }
+      mesh.material.color.setHSL(0.3, 0.8, 0.3 + resource.quality * 0.4);
       mesh.position.set(resource.position.x, 0.15, resource.position.z);
-      scene.add(mesh);
-      resourceMeshesRef.current.set(id, mesh);
     });
   };
 
@@ -1803,6 +1869,7 @@ const EcosystemSimulator = () => {
       { x: 0, y: 1, z: 0 }
     );
     createAgentMesh(playerAgent, scene);
+    playerAgent.mesh.name = 'agent';
     playerAgentRef.current = playerAgent;
 
     const initialAgents = [playerAgent];
@@ -1836,6 +1903,7 @@ const EcosystemSimulator = () => {
       }
       
       createAgentMesh(agent, scene);
+      agent.mesh.name = 'agent';
       initialAgents.push(agent);
     }
     
@@ -1854,23 +1922,18 @@ const EcosystemSimulator = () => {
 
       raycasterRef.current.setFromCamera(mouseRef.current, camera);
       
-      const intersects = raycasterRef.current.intersectObjects(scene.children.filter(obj => obj.name === 'ground'));
+      const intersects = raycasterRef.current.intersectObjects(scene.children.filter(obj => obj.name === 'ground'), true);
       
       if (intersects.length > 0) {
         const point = intersects[0].point;
         playerAgentRef.current.setTargetPosition(point.x, point.z);
         
         // Visual feedback - create a ring at click position
-        const ringGeometry = new THREE.RingGeometry(0.5, 0.7, 16);
-        const ringMaterial = new THREE.MeshBasicMaterial({ 
-          color: 0x00ff00, 
-          side: THREE.DoubleSide,
-          transparent: true,
-          opacity: 0.5 
-        });
-        const ring = new THREE.Mesh(ringGeometry, ringMaterial);
+        const ring = new THREE.Mesh(pooledGeometriesRef.current.ringInner, pooledMaterialsRef.current.clickRing.clone());
         ring.position.set(point.x, 0.1, point.z);
         ring.rotation.x = -Math.PI / 2;
+        ring.renderOrder = 1; // Don't interfere with picking
+        ring.userData.isOverlay = true;
         scene.add(ring);
         
         // Fade out and remove ring
@@ -1881,8 +1944,7 @@ const EcosystemSimulator = () => {
           if (opacity <= 0) {
             scene.remove(ring);
             clearInterval(fadeInterval);
-            ring.geometry.dispose();
-            ring.material.dispose();
+            // keep pooled geometries/materials
           }
         }, 50);
       }
@@ -1952,7 +2014,10 @@ const EcosystemSimulator = () => {
         spherical.setFromVector3(camera.position);
         spherical.theta -= deltaX * 0.01;
         spherical.phi += deltaY * 0.01;
-        spherical.phi = Math.max(0.1, Math.min(Math.PI - 0.1, spherical.phi));
+        // Clamp pitch
+        const minPitch = 0.2;
+        const maxPitch = Math.PI - 0.2;
+        spherical.phi = Math.max(minPitch, Math.min(maxPitch, spherical.phi));
         
         camera.position.setFromSpherical(spherical);
         camera.lookAt(0, 0, 0);
@@ -1966,10 +2031,17 @@ const EcosystemSimulator = () => {
       mouseDown = false;
     };
 
+    // Debounced zoom
+    let wheelTimeout = null;
     const handleWheel = (event) => {
+      event.preventDefault();
+      if (wheelTimeout) return;
+      wheelTimeout = setTimeout(() => {
+        wheelTimeout = null;
+      }, 50);
       const factor = event.deltaY > 0 ? 1.1 : 0.9;
       camera.position.multiplyScalar(factor);
-      camera.position.y = Math.max(5, camera.position.y);
+      camera.position.y = Math.max(5, Math.min(60, camera.position.y));
     };
 
     // Prevent context menu on right click
@@ -2060,34 +2132,27 @@ const EcosystemSimulator = () => {
     const mesh = new THREE.Mesh(geometry, material);
     mesh.position.set(agent.position.x, agent.position.y, agent.position.z);
     mesh.castShadow = true;
+    mesh.name = 'agent';
+    mesh.userData.isAgent = true;
     agent.mesh = mesh;
     scene.add(mesh);
 
     // Add communication ring for causal agents
     if (agent instanceof CausalAgent) {
-      const ringGeometry = new THREE.RingGeometry(1.5, 1.8, 16);
-      const ringMaterial = new THREE.MeshBasicMaterial({ 
-        color: 0x00ff00, 
-        side: THREE.DoubleSide,
-        transparent: true,
-        opacity: 0 
-      });
-      const ring = new THREE.Mesh(ringGeometry, ringMaterial);
+      const ring = new THREE.Mesh(pooledGeometriesRef.current.ringOuter, pooledMaterialsRef.current.ringBasic.clone());
       ring.rotation.x = -Math.PI / 2;
       ring.position.y = -0.3; // Position at ground level
       ring.visible = false; // Start invisible
+      ring.name = 'comm-ring';
+      ring.userData.isOverlay = true;
       mesh.userData.communicationRing = ring;
       mesh.add(ring);
       
       // Add trust indicator sphere
-      const trustGeometry = new THREE.SphereGeometry(0.08, 4, 4);
-      const trustMaterial = new THREE.MeshBasicMaterial({
-        color: 0xffff00,
-        transparent: true,
-        opacity: 0.7
-      });
-      const trustIndicator = new THREE.Mesh(trustGeometry, trustMaterial);
+      const trustIndicator = new THREE.Mesh(pooledGeometriesRef.current.trustSphere, pooledMaterialsRef.current.trustBasic.clone());
       trustIndicator.position.y = 0.5;
+      trustIndicator.name = 'trust-indicator';
+      trustIndicator.userData.isOverlay = true;
       mesh.userData.trustIndicator = trustIndicator;
       mesh.add(trustIndicator);
     }
@@ -2107,7 +2172,7 @@ const EcosystemSimulator = () => {
         agent.isActive = true;
       });
 
-      newAgents.forEach((agent, index) => {
+    newAgents.forEach((agent, index) => {
         // Pass isRunning flag to prevent updates when paused
         const result = agent.update(environment, newAgents, true);
         
@@ -2121,9 +2186,13 @@ const EcosystemSimulator = () => {
             break;
           case 'reproduce': {
             const survivalThreshold = environment.getDynamicSurvivalThreshold(newAgents.length);
-            if (newAgents.length < 120 && agent.energy > Math.max(15, survivalThreshold * 0.5)) {
+            if (newAgents.length < MAX_AGENTS && agent.energy > Math.max(15, survivalThreshold * 0.5)) {
               const offspring = agent.reproduce();
               createAgentMesh(offspring, sceneRef.current);
+              if (offspring.mesh) {
+                offspring.mesh.name = 'agent';
+                offspring.mesh.userData.isAgent = true;
+              }
               toAdd.push(offspring);
             }
             break;
